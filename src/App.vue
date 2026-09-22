@@ -1,194 +1,78 @@
 <script setup lang="ts">
-import { computed, reactive, ref } from "vue";
+// 含税倒推与税务复核台 —— 展示层：组装表单、单据列表、受阻台、规则表
+import { computed, ref } from "vue";
+import { splitOf, usePriceStore, type ActionResult } from "./store/priceStore";
+import { currentVersion } from "./store/types";
+import { FUELS, STATIONS } from "./rules/constants";
+import { STATUS_TEXT, type VersionStatus } from "./rules/validation";
+import type { PriceDocument } from "./store/types";
+import PriceForm from "./components/PriceForm.vue";
+import DocumentCard from "./components/DocumentCard.vue";
+import BlockedList from "./components/BlockedList.vue";
+import RulesPanel from "./components/RulesPanel.vue";
 
-type Field = {
-  key: string;
-  label: string;
-  type?: "number" | "date" | "select";
-  options?: readonly string[];
-};
+const store = usePriceStore();
 
-type RecordItem = {
-  id: string;
-  status: string;
-  notes: string;
-  createdAt: string;
-  [key: string]: string | number;
-};
+const stationFilter = ref("");
+const fuelFilter = ref("");
+const statusFilter = ref<"" | VersionStatus>("");
+const editingId = ref<string | null>(null);
+const toast = ref<{ ok: boolean; text: string } | null>(null);
 
-const project = {
-  "number": 9,
-  "folder": "dfwl/frontend/dfwlfront-9",
-  "framework": "vue",
-  "title": "油品价格维护",
-  "subtitle": "维护挂牌价、记录更新时间，并支持恢复默认价格。",
-  "industry": "石油",
-  "stack": [
-    "Vue3",
-    "Vite",
-    "TypeScript",
-    "Pinia",
-    "Naive UI"
-  ],
-  "storageKey": "dfwlfront-9-price",
-  "formTitle": "调整油品价格",
-  "primaryAction": "保存价格",
-  "entityLabel": "油品",
-  "statuses": [
-    "生效中",
-    "待确认",
-    "已回退"
-  ],
-  "filters": [
-    "全部油品",
-    "92号汽油",
-    "95号汽油",
-    "98号汽油",
-    "柴油"
-  ],
-  "fields": [
-    {
-      "key": "fuel",
-      "label": "油品",
-      "type": "select",
-      "options": [
-        "92号汽油",
-        "95号汽油",
-        "98号汽油",
-        "柴油"
-      ]
-    },
-    {
-      "key": "price",
-      "label": "挂牌价",
-      "type": "number"
-    },
-    {
-      "key": "operator",
-      "label": "操作员"
-    },
-    {
-      "key": "effectiveDate",
-      "label": "生效日期",
-      "type": "date"
-    }
-  ],
-  "records": [
-    {
-      "fuel": "92号汽油",
-      "price": 7.62,
-      "operator": "站长",
-      "effectiveDate": "2026-06-30",
-      "status": "生效中",
-      "notes": "正常调价"
-    },
-    {
-      "fuel": "柴油",
-      "price": 7.18,
-      "operator": "值班经理",
-      "effectiveDate": "2026-06-30",
-      "status": "待确认",
-      "notes": "等待复核"
-    }
-  ],
-  "metricLabels": [
-    "油品数",
-    "待确认",
-    "平均挂牌价"
-  ]
-} as const;
+const editingDoc = computed(() =>
+  editingId.value ? store.documents.find((d) => d.id === editingId.value) ?? null : null
+);
 
-const fields = project.fields as readonly Field[];
-const statuses = [...project.statuses];
+const filtered = computed(() =>
+  store.orderedDocuments.filter((doc) => {
+    const v = currentVersion(doc);
+    if (stationFilter.value && doc.station !== stationFilter.value) return false;
+    if (fuelFilter.value && doc.fuel !== fuelFilter.value) return false;
+    if (statusFilter.value && v.status !== statusFilter.value) return false;
+    return true;
+  })
+);
 
-function createBlank() {
-  return Object.fromEntries(fields.map((field) => [field.key, field.type === "number" ? 0 : ""]));
-}
+const statusOptions = Object.entries(STATUS_TEXT) as [VersionStatus, string][];
 
-function loadRecords(): RecordItem[] {
-  const raw = localStorage.getItem(project.storageKey);
-  if (!raw) {
-    return project.records.map((record, index) => ({
-      ...record,
-      id: `seed-${index + 1}`,
-      createdAt: new Date(Date.now() - index * 86400000).toISOString()
-    })) as RecordItem[];
+function showResult(r: ActionResult) {
+  if (r.ok) {
+    toast.value = { ok: true, text: "操作成功，数据已持久化。" };
+    editingId.value = null;
+  } else {
+    toast.value = {
+      ok: false,
+      text: `被 ${r.violations.map((v) => v.rule).join("、")} 拦截，详见受阻台。`
+    };
   }
-  try {
-    return JSON.parse(raw) as RecordItem[];
-  } catch {
-    return [];
+  window.setTimeout(() => (toast.value = null), 3500);
+}
+
+function startEdit(doc: PriceDocument) {
+  editingId.value = doc.id;
+  window.scrollTo({ top: 0, behavior: "smooth" });
+}
+
+const chartRows = computed(() =>
+  statusOptions.map(([status, text]) => ({
+    status,
+    text,
+    value: store.documents.filter((d) => currentVersion(d).status === status).length
+  }))
+);
+const maxChart = computed(() => Math.max(1, ...chartRows.value.map((r) => r.value)));
+
+// 金额拆分一致性校验（刷新后仍可证明存储金额自洽）
+const consistency = computed(() => {
+  let bad = 0;
+  for (const doc of store.documents) {
+    for (const v of doc.versions) {
+      const s = splitOf(v);
+      if (v.grossFen - v.netFen - v.taxFen !== 0 || !s.balanced) bad += 1;
+    }
   }
-}
-
-const records = ref<RecordItem[]>(loadRecords());
-const form = reactive<Record<string, string | number>>(createBlank());
-const note = ref("");
-const filter = ref(project.filters[0]);
-
-const filteredRecords = computed(() => {
-  if (filter.value.startsWith("全部")) return records.value;
-  return records.value.filter((record) => Object.values(record).includes(filter.value));
+  return { total: store.frozenVersionCount, bad };
 });
-
-const metrics = computed(() => {
-  const total = records.value.length;
-  const second = records.value.filter((record) => record.status === statuses[1]).length;
-  const third = records.value.filter((record) => record.status === statuses[2]).length;
-  const numberValues = records.value.flatMap((record) =>
-    fields.filter((field) => field.type === "number").map((field) => Number(record[field.key] || 0))
-  );
-  const sum = numberValues.reduce((acc, value) => acc + value, 0);
-  return [total, second || sum, third || Math.round(sum / Math.max(total, 1))];
-});
-
-const chartRows = computed(() => statuses.map((status) => ({
-  status,
-  value: records.value.filter((record) => record.status === status).length
-})));
-
-const maxChart = computed(() => Math.max(1, ...chartRows.value.map((row) => row.value)));
-
-function persist() {
-  localStorage.setItem(project.storageKey, JSON.stringify(records.value));
-}
-
-function nextStatus(status: string) {
-  const index = statuses.indexOf(status);
-  return statuses[(index + 1) % statuses.length];
-}
-
-function primaryText(record: RecordItem) {
-  const first = fields[0];
-  const second = fields[1];
-  return [record[first.key], record[second.key]].filter(Boolean).join(" / ") || project.entityLabel;
-}
-
-function submit() {
-  records.value = [
-    {
-      ...form,
-      id: crypto.randomUUID(),
-      status: statuses[0],
-      notes: note.value || "暂无备注",
-      createdAt: new Date().toISOString()
-    } as RecordItem,
-    ...records.value
-  ];
-  Object.assign(form, createBlank());
-  note.value = "";
-  persist();
-}
-
-function flow(record: RecordItem) {
-  record.status = nextStatus(record.status);
-  persist();
-}
-
-function remove(id: string) {
-  records.value = records.value.filter((record) => record.id !== id);
-  persist();
-}
 </script>
 
 <template>
@@ -196,78 +80,97 @@ function remove(id: string) {
     <div class="shell">
       <header class="topbar">
         <div>
-          <p class="eyebrow">{{ project.industry }}行业前端最小闭环</p>
-          <h1>{{ project.title }}</h1>
-          <p class="subtitle">{{ project.subtitle }}</p>
+          <p class="eyebrow">石油行业 · 含税倒推与税务复核台</p>
+          <h1>油品价格维护</h1>
+          <p class="subtitle">
+            调价单填写站点、油品、含税售价、税率和生效日，自动倒推不含税价与税额；
+            按分后三项金额必须相等，差额超过一分不得发布；同站同油品同生效日唯一；
+            税额异常须财务写依据并复核，通过后冻结税率、金额和依据，更正另立版本留旧值。
+          </p>
         </div>
         <div class="stack">
-          <span v-for="item in project.stack" :key="item" class="tag">{{ item }}</span>
+          <span class="tag">Vue3</span>
+          <span class="tag">Pinia</span>
+          <span class="tag">规则/存储/展示分离</span>
+          <button type="button" class="secondary reset-btn" @click="store.resetAll()">恢复演示数据</button>
         </div>
       </header>
 
+      <transition name="toast">
+        <div v-if="toast" class="toast" :class="toast.ok ? 'ok' : 'fail'">
+          {{ toast.text }}
+        </div>
+      </transition>
+
       <section class="metrics">
-        <article v-for="(label, index) in project.metricLabels" :key="label" class="metric">
-          <span>{{ label }}</span>
-          <strong>{{ metrics[index] }}</strong>
+        <article class="metric">
+          <span>调价单（同键唯一）</span><strong>{{ store.documents.length }}</strong>
+        </article>
+        <article class="metric">
+          <span>待财务复核</span><strong>{{ store.pendingCount }}</strong>
+        </article>
+        <article class="metric">
+          <span>已发布（冻结）</span><strong>{{ store.approvedCount }}</strong>
+        </article>
+        <article class="metric">
+          <span>冻结版本数（含旧版）</span><strong>{{ store.frozenVersionCount }}</strong>
         </article>
       </section>
 
+      <p class="consistency" :class="consistency.bad ? 'danger' : 'ok'">
+        刷新一致性自检：{{ store.frozenVersionCount ? `全部 ${consistency.total} 个版本` : "暂无版本" }}
+        金额拆分 {{ consistency.bad ? `有 ${consistency.bad} 个不自洽` : "恒等一致（含税＝不含税＋税额，分）" }}
+      </p>
+
       <section class="workspace">
-        <form class="panel" @submit.prevent="submit">
-          <h2>{{ project.formTitle }}</h2>
-          <div class="form-grid">
-            <label v-for="field in fields" :key="field.key">
-              {{ field.label }}
-              <select v-if="field.type === 'select'" v-model="form[field.key]" required>
-                <option value="">请选择</option>
-                <option v-for="option in field.options" :key="option">{{ option }}</option>
-              </select>
-              <input v-else v-model="form[field.key]" :type="field.type || 'text'" required />
-            </label>
-            <label>
-              备注
-              <textarea v-model="note" placeholder="填写处理说明或现场备注" />
-            </label>
-            <button type="submit">{{ project.primaryAction }}</button>
-          </div>
-        </form>
+        <div class="left-col">
+          <PriceForm :editing="editingDoc" @done="showResult" @cancel-edit="editingId = null" />
+          <RulesPanel />
+        </div>
 
         <section class="list-panel">
-          <div class="toolbar">
-            <h2>{{ project.entityLabel }}列表</h2>
-            <select v-model="filter">
-              <option v-for="item in project.filters" :key="item">{{ item }}</option>
-            </select>
+          <div class="toolbar list-toolbar">
+            <h2>调价单复核台</h2>
+            <div class="filters">
+              <select v-model="stationFilter">
+                <option value="">全部站点</option>
+                <option v-for="s in STATIONS" :key="s" :value="s">{{ s }}</option>
+              </select>
+              <select v-model="fuelFilter">
+                <option value="">全部油品</option>
+                <option v-for="f in FUELS" :key="f" :value="f">{{ f }}</option>
+              </select>
+              <select v-model="statusFilter">
+                <option value="">全部状态</option>
+                <option v-for="[value, text] in statusOptions" :key="value" :value="value">{{ text }}</option>
+              </select>
+            </div>
           </div>
 
-          <div class="record-grid">
-            <div v-if="filteredRecords.length === 0" class="empty">暂无匹配数据</div>
-            <article v-for="record in filteredRecords" :key="record.id" class="record">
-              <div class="record-head">
-                <p class="record-title">{{ primaryText(record) }}</p>
-                <span class="status">{{ record.status }}</span>
-              </div>
-              <div class="details">
-                <span v-for="field in fields" :key="field.key">{{ field.label }}: {{ record[field.key] }}</span>
-              </div>
-              <p class="note">{{ record.notes }}</p>
-              <div class="actions">
-                <button type="button" @click="flow(record)">流转状态</button>
-                <button class="secondary" type="button" @click="navigator.clipboard?.writeText(primaryText(record))">复制摘要</button>
-                <button class="danger" type="button" @click="remove(record.id)">删除</button>
-              </div>
-            </article>
+          <div class="doc-grid">
+            <div v-if="filtered.length === 0" class="empty">暂无匹配调价单</div>
+            <DocumentCard
+              v-for="doc in filtered"
+              :key="doc.id"
+              :doc="doc"
+              @edit="startEdit"
+              @result="showResult"
+            />
           </div>
 
           <div class="mini-chart">
             <div v-for="row in chartRows" :key="row.status" class="bar">
-              <span>{{ row.status }}</span>
-              <div class="bar-track"><div class="bar-fill" :style="{ width: `${(row.value / maxChart) * 100}%` }" /></div>
+              <span>{{ row.text }}</span>
+              <div class="bar-track">
+                <div class="bar-fill" :style="{ width: `${(row.value / maxChart) * 100}%` }" />
+              </div>
               <strong>{{ row.value }}</strong>
             </div>
           </div>
         </section>
       </section>
+
+      <BlockedList />
     </div>
   </main>
 </template>
